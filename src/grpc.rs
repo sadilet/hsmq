@@ -1,4 +1,5 @@
 use crate::auth::Auth;
+use crate::config::Config;
 use crate::errors::{GenericError, SendMessageError};
 use crate::metrics::{self, GRPC_COUNTER};
 use crate::pb::{
@@ -9,6 +10,8 @@ use crate::server::{
     self, Consumer, ConsumerSendResult, Envelop, GenericConsumer, HsmqServer, QueueCommand,
     Subscription,
 };
+use crate::{cluster, web};
+
 use prometheus::core::{AtomicF64, GenericCounter, GenericGauge};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
@@ -16,6 +19,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use std::{error::Error, io::ErrorKind};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
@@ -36,7 +40,7 @@ impl GrpcService {
     pub fn new(addr: SocketAddr, task_tracker: TaskTracker) -> Self {
         Self { addr, task_tracker }
     }
-    pub async fn run(&self, hsmq: HsmqServer, auth: Arc<Auth>) {
+    pub async fn run(&self, hsmq: HsmqServer, auth: Arc<Auth>, listener: Option<TcpListener>) {
         let task_tracker = self.task_tracker.clone();
 
         let (mut health_reporter, health_service) = tonic_health::server::health_reporter();
@@ -47,10 +51,20 @@ impl GrpcService {
         let svc =
             hsmq_server::HsmqServer::with_interceptor(hsmq, move |req| auth.grpc_check_auth(req));
         log::info!("Run grpc on {:?}", &self.addr);
+        println!("{:?}", listener);
+
+        let incoming = match listener {
+            Some(l) => l,
+            None => TcpListener::bind(self.addr).await.unwrap(),
+        };
+
         if let Err(e) = TonicServer::builder()
             .add_service(health_service)
             .add_service(svc)
-            .serve_with_shutdown(self.addr, async move { task_tracker.wait().await })
+            .serve_with_incoming_shutdown(
+                tokio_stream::wrappers::TcpListenerStream::new(incoming),
+                async move { task_tracker.wait().await },
+            )
             .await
         {
             self.task_tracker.close();
@@ -684,6 +698,125 @@ fn match_for_io_error(err_status: &Status) -> Option<&std::io::Error> {
             None => return None,
         };
     }
+}
+
+async fn ctrl_c(graceful: bool) {
+    match tokio::signal::ctrl_c().await {
+        Ok(_) => {
+            if graceful {
+                println!(" Graceful shutdown by CTRL+C");
+            } else {
+                println!(" Force shutdown by CTRL+C");
+            }
+        }
+        Err(_) => {
+            log::error!("Failed to install Ctrl+C handler");
+        }
+    }
+}
+
+pub async fn run(cfg: Config, listener: Option<TcpListener>) -> Result<(), GenericError> {
+    crate::tracing::init_subscriber(&cfg)?;
+
+    let hostname = gethostname::gethostname().to_string_lossy().to_string();
+
+    let task_tracker = tokio_util::task::task_tracker::TaskTracker::new();
+
+    let hsmq = HsmqServer::from(cfg.clone(), task_tracker.clone()).await?;
+    let auth = Arc::new(Auth::new(cfg.auth.clone()).with_users(cfg.users.clone()));
+
+    let mut tasks = JoinSet::new();
+
+    if let Some(grpc_addr) = cfg.node.grpc_address {
+        let grpc_srv = GrpcService::new(grpc_addr, task_tracker.clone());
+        let auth = auth.clone();
+        tasks.spawn(async move {
+            grpc_srv.run(hsmq, auth, listener).await;
+        });
+    }
+
+    if let Some(ref prometheus) = cfg.prometheus {
+        if let Some(addr) = &prometheus.http_address {
+            let w = web::WebServer::new(*addr, task_tracker.clone());
+            let mut pcfg = prometheus.clone();
+            if let Some(cluster) = cfg.cluster_name() {
+                pcfg.labels.insert("cluster".to_string(), cluster);
+            }
+            tasks.spawn(async move {
+                w.serve_metrics(pcfg).run().await;
+            });
+        }
+    };
+
+    if let Some(ref cluster) = cfg.cluster {
+        let mut cluster_cfg = cluster.clone();
+        cluster_cfg.jwt = Some(cfg.cluster_jwt());
+        let node_name = format!("{}:{}", hostname, cluster.udp_port);
+        let w = cluster::Cluster::new(cluster_cfg, node_name, task_tracker.clone());
+        tasks.spawn(w.run());
+    };
+
+    #[cfg(feature = "consul")]
+    let srv_consul = if let Some(cfg) = cfg.consul {
+        let c = crate::consul::Consul::new(cfg);
+        if let Err(e) = c.start().await {
+            ::tracing::error!("Error consul start {:?}", e);
+        }
+        Some(c)
+    } else {
+        None
+    };
+
+    #[cfg(not(unix))]
+    let shutdown = ctrl_c(true);
+
+    #[cfg(unix)]
+    let shutdown = async {
+        let s = tokio::signal::unix::SignalKind::terminate();
+        match tokio::signal::unix::signal(s) {
+            Ok(mut res) => {
+                tokio::select! {
+                    _ = ctrl_c(true) => (),
+                    _ = res.recv() => {
+                        log::info!("Graceful shutdown by signal TERM");
+                    }
+                    _ = task_tracker.wait() => (),
+                }
+            }
+            Err(_) => {
+                log::error!("Failed to install signal handler");
+                tokio::select! {
+                    _ = ctrl_c(true) => (),
+                    _ = task_tracker.wait() => (),
+                }
+            }
+        }
+    };
+
+    shutdown.await;
+    task_tracker.close();
+
+    #[cfg(feature = "consul")]
+    if let Some(c) = srv_consul {
+        if let Err(e) = c.stop().await {
+            ::tracing::error!("Error consul stop {:?}", e);
+        }
+    }
+
+    loop {
+        tokio::select! {
+            _ = tasks.join_next() => {
+                if tasks.is_empty() {
+                    break;
+                };
+            }
+            _ = ctrl_c(false) => {
+                break;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
