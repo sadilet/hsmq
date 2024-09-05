@@ -255,10 +255,15 @@ where
         let consumer = self.clone();
         let prefetch = self.inner.prefetch_count > 0;
         let timeout = unack.timeout;
-        if prefetch {
+
+        if self.inner.is_ackable {
             unack.insert(msg.clone());
+        }
+
+        if prefetch {
             self.inner.prefetch_semaphore.forget_permits(1);
         }
+
         tasks.spawn(async move {
             if consumer.send_message(msg.clone()).await.is_err() {
                 ConsumerSendResult::RequeueAck(msg)
@@ -543,7 +548,7 @@ impl GrpcStreaming {
         }
     }
 
-    async fn req_kind(&mut self, kind: pb::request::Kind) -> Result<(), GenericError> {
+    async fn req_kind(&mut self, kind: pb::request::Kind) -> anyhow::Result<()> {
         match kind {
             pb::request::Kind::PublishMessage(pb::PublishMessage {
                 message: Some(message),
@@ -557,7 +562,10 @@ impl GrpcStreaming {
                 span.set_parent(envelop.span.context());
 
                 if let Some(subscription) = self.subscriptions.get(&topic) {
-                    subscription.publish(envelop).await;
+                    subscription
+                        .publish(envelop)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Publish error"))?;
                     self.m_publish_ok.inc();
                     if qos == 1 {
                         let kind = Some(pb::response::Kind::PubAck(pb::PubAck { request_id }));
@@ -571,7 +579,7 @@ impl GrpcStreaming {
                         topic,
                         info: m.to_string(),
                     }));
-                    self.out_tx.send(Ok(pb::Response { kind })).await?;
+                    let _ = self.out_tx.send(Ok(pb::Response { kind })).await;
                     return Err(Status::not_found(m))?;
                 }
             }
@@ -590,7 +598,10 @@ impl GrpcStreaming {
                             prefetch_count as usize,
                             false,
                         );
-                        let q = queue.subscribe(consumer).await?;
+                        let q = queue
+                            .subscribe(consumer)
+                            .await
+                            .map_err(|_| anyhow::anyhow!("Subscribe error"))?;
                         self.subs.insert(queue_name.clone(), q);
                     }
                 }
@@ -643,7 +654,10 @@ impl GrpcStreaming {
                         0,
                         autoack,
                     );
-                    let mut subscriber = qu.subscribe(consumer).await?;
+                    let mut subscriber = qu
+                        .subscribe(consumer)
+                        .await
+                        .map_err(|_| anyhow::anyhow!("Subscribe error"))?;
                     let r = subscriber.fetch(deadline).await;
                     self.subs.insert(queue.clone(), subscriber);
                     r.map_err(|e| {
